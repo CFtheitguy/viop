@@ -1,0 +1,1055 @@
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname || "/";
+
+    // -------- PUBLIC: Serve uploaded MMS from R2 --------
+    if (path.startsWith("/mms/")) {
+      return serveMmsObject(request, env, path);
+    }
+
+    // -------- SignalWire Webhooks --------
+    if (path === "/sms") return handleSms(request, env);
+    if (path === "/ivr") return handleIvr(request, env);
+
+    // -------- Auth --------
+    if (path === "/login" && request.method === "GET") return renderLogin();
+    if (path === "/login" && request.method === "POST") return handleLogin(request, env);
+
+    // -------- Inbox (auth required) --------
+    if (path === "/" || path === "/inbox") {
+      if (!(await isAuthed(request))) return redirect("/login");
+      return renderInbox(env, url.origin);
+    }
+
+    // -------- API (auth required) --------
+    if (path.startsWith("/api/")) {
+      if (!(await isAuthed(request))) return json({ error: "Unauthorized" }, 401);
+
+      if (path === "/api/conversations") return listConversations(env);
+      if (path === "/api/messages") return getMessages(request, env);
+      if (path === "/api/start" && request.method === "POST") return apiStartConversation(request, env);
+      if (path === "/api/send" && request.method === "POST") return apiSendMessage(request, env);
+      if (path === "/api/upload" && request.method === "POST") return apiUpload(request, env, url.origin);
+
+      return json({ error: "Not found" }, 404);
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+};
+
+/* ================= AUTH ================= */
+
+async function isAuthed(request) {
+  const cookie = request.headers.get("Cookie") || "";
+  return cookie.includes("ltm_auth=ok");
+}
+
+function redirect(location) {
+  return new Response("", { status: 302, headers: { Location: location } });
+}
+
+function renderLogin() {
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Linear Tech Messaging - Login</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; background:#0b1220; color:#e5e7eb; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+    .card { background:#020617; border:1px solid #1f2937; padding:28px; border-radius:16px; width:320px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+    h1 { margin:0 0 14px 0; font-size:18px; text-align:center; font-weight:900; }
+    label { display:block; margin-bottom:8px; font-size:13px; opacity:.9; }
+    input[type=password] { width:100%; padding:10px; border-radius:10px; border:1px solid #334155; background:#0b1220; color:#e5e7eb; outline:none; }
+    button { margin-top:14px; width:100%; padding:10px; border-radius:10px; border:none; background:#22c55e; color:#022c22; font-weight:900; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Linear Tech Messaging</h1>
+    <form method="POST" action="/login">
+      <label>Password</label>
+      <input type="password" name="password" autocomplete="current-password" required />
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>`.trim();
+
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+async function handleLogin(request, env) {
+  const form = await request.formData();
+  const password = String(form.get("password") || "");
+  if (password !== env.INBOX_PASSWORD) return new Response("Invalid password", { status: 401 });
+
+  return new Response("", {
+    status: 302,
+    headers: {
+      "Set-Cookie": "ltm_auth=ok; HttpOnly; Secure; SameSite=Lax; Path=/",
+      Location: "/inbox",
+    },
+  });
+}
+
+/* ================= UI ================= */
+
+function renderInbox(env, origin) {
+  // IMPORTANT: Do NOT print secrets in HTML.
+  const sipUser = env.WEBPHONE_SIP_USER || env.SIP_USER || "phone";
+  const sipDomain = env.WEBPHONE_SIP_DOMAIN || "linearconnect-bd2c7f803909.sip.signalwire.com";
+  const wsUri = `wss://${sipDomain}`;
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Linear Tech Messaging</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    * { box-sizing:border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#020617; color:#e5e7eb; }
+    .app { display:flex; height:100vh; width:100vw; overflow:hidden; }
+
+    /* Sidebar */
+    .sidebar { width:280px; min-width:240px; border-right:1px solid #1f2937; background:#020617; display:flex; flex-direction:column; }
+    .sidebar-header { padding:14px 16px; border-bottom:1px solid #1f2937; font-weight:900; font-size:15px; }
+    .sidebar-tools { padding:12px; border-bottom:1px solid #1f2937; display:flex; flex-direction:column; gap:10px; }
+    .btn { width:100%; padding:9px 10px; border-radius:12px; border:none; font-weight:900; cursor:pointer; }
+    .btn-green { background:#22c55e; color:#022c22; }
+    .btn-blue { background:#3b82f6; color:#fff; }
+    .btn-red { background:#ef4444; color:#fff; }
+    .panel { display:none; margin-top:6px; }
+    .panel input { width:100%; padding:9px 10px; border-radius:12px; background:#0b1220; border:1px solid #334155; color:#e5e7eb; outline:none; }
+
+    .conv-list { flex:1; overflow-y:auto; }
+    .conv { padding:10px 14px; border-bottom:1px solid #0f172a; cursor:pointer; }
+    .conv.active { background:#111827; }
+    .conv-top { display:flex; justify-content:space-between; gap:10px; }
+    .conv-phone { font-weight:900; font-size:13px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    .conv-time { font-size:11px; opacity:.7; white-space:nowrap; }
+    .conv-preview { font-size:12px; opacity:.75; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; margin-top:2px; }
+
+    /* Main */
+    .main { flex:1; display:flex; flex-direction:column; min-width:0; }
+
+    /* Phone bar */
+    .phonebar {
+      padding:10px 16px;
+      border-bottom:1px solid #1f2937;
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+      background:#020617;
+    }
+    .phone-top {
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      overflow:hidden;
+      white-space:nowrap;
+      text-overflow:ellipsis;
+      font-size:12px;
+      color:#9ca3af;
+    }
+    .dot { width:9px; height:9px; border-radius:999px; display:inline-block; margin-right:8px; background:#ef4444; }
+    .dot.on { background:#22c55e; }
+    .phone-row {
+      display:grid;
+      grid-template-columns: 1fr auto;
+      gap:16px;
+      align-items:flex-start;
+    }    .phone-row input {
+      flex:1;
+      min-width:200px;
+      max-width:520px;
+      padding:10px 12px;
+      border-radius:999px;
+      border:1px solid #374151;
+      background:#020617;
+      color:#e5e7eb;
+      outline:none;
+      font-size:14px;
+    }
+    .phone-row button {
+      padding:10px 14px;
+      border-radius:999px;
+      border:none;
+      font-weight:900;
+      cursor:pointer;
+    }
+    #callBtn { background:#22c55e; color:#022c22; }
+    #hangupBtn { background:#ef4444; color:#fff; }
+    #hangupBtn:disabled { opacity:.5; cursor:not-allowed; }
+
+    .dialpad {
+      display:grid;
+      grid-template-columns:repeat(3, 1fr);
+      gap:4px;
+      max-width:150px;
+    }
+    .dialpad button {
+      padding:12px 0;
+      border-radius:14px;
+      border:1px solid rgba(255,255,255,.08);
+      background:#0b1220;
+      color:#e5e7eb;
+      font-weight:900;
+      cursor:pointer;
+      font-size:16px;
+    }
+
+    .incoming {
+      display:none;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      padding:10px 12px;
+      border-radius:14px;
+      background:#111827;
+      border:1px solid rgba(255,255,255,.06);
+      font-size:13px;
+    }
+    .incoming .actions { display:flex; gap:8px; }
+    .incoming .actions button { padding:8px 10px; border-radius:999px; border:none; font-weight:900; cursor:pointer; }
+    #answerBtn { background:#22c55e; color:#022c22; }
+    #declineBtn { background:#ef4444; color:#fff; }
+
+    /* Messages */
+    .main-header { padding:12px 16px; border-bottom:1px solid #1f2937; font-size:15px; font-weight:950; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .messages { flex:1; padding:14px 16px; overflow-y:auto; display:flex; flex-direction:column; gap:10px; }
+    .msg-wrap { max-width:820px; width:100%; }
+    .msg { max-width:78%; padding:10px 12px; border-radius:14px; font-size:14px; line-height:1.3;
+           white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; }
+    .inbound { background:#111827; align-self:flex-start; }
+    .outbound { background:#22c55e; color:#022c22; align-self:flex-end; }
+    .ts { font-size:10px; opacity:.65; margin-top:3px; }
+
+    .media { margin-top:8px; display:flex; flex-wrap:wrap; gap:8px; }
+    .media img {
+      width:140px;
+      height:140px;
+      object-fit:cover;
+      border-radius:12px;
+      border:1px solid rgba(255,255,255,.08);
+      cursor:pointer;
+    }
+
+    .composer { padding:12px 16px; border-top:1px solid #1f2937; display:flex; gap:10px; align-items:center; }
+    .composer input { flex:1; padding:10px 12px; border-radius:999px; border:1px solid #374151; background:#020617; color:#e5e7eb; outline:none; min-width:0; }
+    .composer button { padding:10px 16px; border-radius:999px; background:#22c55e; border:none; color:#022c22; font-weight:950; cursor:pointer; }
+
+    /* MMS tools */
+    .mms-tools { padding:0 16px 14px 16px; display:flex; flex-direction:column; gap:10px; }
+    .mms-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .mms-row input[type=text] {
+      flex:1;
+      min-width:240px;
+      padding:9px 10px;
+      border-radius:12px;
+      border:1px solid #334155;
+      background:#0b1220;
+      color:#e5e7eb;
+      outline:none;
+    }
+    .hint { font-size:11px; opacity:.7; line-height:1.3; }
+    .drop {
+      border:1px dashed rgba(255,255,255,.18);
+      border-radius:14px;
+      padding:12px;
+      background:#0b1220;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .drop strong { font-size:12px; }
+    .drop input { max-width:220px; }
+
+    @media (max-width: 900px) {
+      .sidebar { width:240px; }
+      .msg { max-width:86%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="sidebar">
+      <div class="sidebar-header">Linear Tech</div>
+
+      <div class="sidebar-tools">
+        <button id="newConvBtn" class="btn btn-green">+ New Message</button>
+
+        <div id="newConvPanel" class="panel">
+          <input id="newNumberInput" placeholder="Enter phone number..." />
+          <button id="startConvBtn" class="btn btn-blue" style="margin-top:8px;">Start Chat</button>
+          <div class="hint" style="margin-top:8px;">Creates the chat in your inbox without sending an SMS.</div>
+        </div>
+      </div>
+
+      <div class="conv-list" id="convList"></div>
+    </div>
+
+    <div class="main">
+      <!-- WEBRTC PHONE -->
+      <div class="phonebar">
+        <div class="phone-top">
+          <div><span class="dot" id="dot"></span><span id="status">Connecting…</span></div>
+          <div style="opacity:.8; overflow:hidden; text-overflow:ellipsis;">
+            WebRTC SIP: ${sipUser}@${sipDomain}
+          </div>
+        </div>
+
+        <div class="incoming" id="incomingBox">
+          <div><strong>Incoming:</strong> <span id="incomingFrom">Unknown</span></div>
+          <div class="actions">
+            <button id="answerBtn" type="button">Answer</button>
+            <button id="declineBtn" type="button">Decline</button>
+          </div>
+        </div>
+
+        <div class="phone-row">
+          <input id="dialInput" placeholder="Enter number to call…" autocomplete="off" />
+          <button id="callBtn" type="button">Call</button>
+          <button id="hangupBtn" type="button" disabled>Hang up</button>
+        </div>
+
+        <div class="phone-row" style="justify-content:space-between; align-items:flex-start;">
+          <div class="dialpad" id="dialpad"></div>
+          <div class="hint" style="max-width:520px;">
+            Tip: When you press IVR option <b>1</b>, it will ring this browser once it shows <b>Registered</b>.
+          </div>
+        </div>
+      </div>
+
+      <div class="main-header" id="activeTitle">Select a conversation</div>
+      <div class="messages" id="messages"></div>
+
+      <form class="composer" id="composer">
+        <input id="messageInput" placeholder="Message…" autocomplete="off" />
+        <button type="submit">Send</button>
+      </form>
+
+      <div class="mms-tools">
+        <div class="mms-row">
+          <input id="mmsUrl" type="text" placeholder="Optional outbound MMS Image URL (https://...)" />
+          <button id="sendMmsUrlBtn" class="btn btn-blue" type="button" style="width:auto;">Send MMS URL</button>
+        </div>
+
+        <div class="drop" id="dropZone">
+          <div>
+            <strong>Outbound MMS upload</strong>
+            <div class="hint">Choose a file (or drop it here). Requires R2 bucket binding.</div>
+          </div>
+          <div class="mms-row" style="margin:0;">
+            <input id="filePick" type="file" accept="image/*" />
+            <button id="uploadSendBtn" class="btn btn-blue" type="button" style="width:auto;">Upload + Send</button>
+          </div>
+        </div>
+
+        <div class="hint" id="mmsHint"></div>
+      </div>
+    </div>
+  </div>
+
+  <audio id="remoteAudio" autoplay style="display:none"></audio>
+
+  <script src="https://unpkg.com/jssip@3.10.0/dist/jssip.min.js"></script>  <script>
+    // ======== SIP CONFIG (no secrets printed) ========
+    const SIP_DOMAIN = ${JSON.stringify(sipDomain)};
+    const SIP_USER   = ${JSON.stringify(sipUser)};
+    const SIP_WS_URI = ${JSON.stringify(wsUri)};
+    // Password must come from env at runtime (injected server-side)
+    const SIP_PASSWORD = ${JSON.stringify(env.WEBPHONE_SIP_PASSWORD || "")};
+
+    let ua = null;
+    let session = null;
+
+    function setStatus(text, up) {
+      document.getElementById('status').textContent = text;
+      const dot = document.getElementById('dot');
+      if (up) dot.classList.add('on'); else dot.classList.remove('on');
+    }
+
+    function setInCall(inCall) {
+      document.getElementById('callBtn').disabled = !!inCall;
+      document.getElementById('hangupBtn').disabled = !inCall;
+    }
+
+    function showIncoming(from) {
+      document.getElementById('incomingFrom').textContent = from || 'Unknown';
+      document.getElementById('incomingBox').style.display = 'flex';
+    }
+    function hideIncoming() {
+      document.getElementById('incomingBox').style.display = 'none';
+    }
+
+    function attachSessionEvents(s) {
+      const remoteAudio = document.getElementById('remoteAudio');
+
+      s.on('accepted', () => {
+        setStatus('In call', true);
+        setInCall(true);
+        hideIncoming();
+      });
+
+      s.on('ended', () => {
+        setStatus('Registered', true);
+        session = null;
+        setInCall(false);
+        hideIncoming();
+      });
+
+      s.on('failed', (e) => {
+        setStatus('Call failed: ' + (e && e.cause ? e.cause : ''), true);
+        session = null;
+        setInCall(false);
+        hideIncoming();
+      });
+
+      s.on('peerconnection', (e) => {
+        const pc = e.peerconnection;
+        pc.addEventListener('track', (ev) => {
+          if (ev.streams && ev.streams[0]) {
+            remoteAudio.srcObject = ev.streams[0];
+          }
+        });
+      });
+    }
+
+    function initWebRTC() {
+      if (!window.JsSIP) {
+        setStatus('Phone lib failed to load', false);
+        return;
+      }
+      if (!SIP_PASSWORD) {
+        setStatus('Missing SIP password env var', false);
+        return;
+      }
+
+      try {
+        const socket = new JsSIP.WebSocketInterface(SIP_WS_URI);
+        const config = {
+          sockets: [socket],
+          uri: 'sip:' + SIP_USER + '@' + SIP_DOMAIN,
+          password: SIP_PASSWORD,
+          session_timers: false
+        };
+
+        ua = new JsSIP.UA(config);
+
+        ua.on('connected', () => setStatus('Connected', true));
+        ua.on('disconnected', () => setStatus('Disconnected', false));
+        ua.on('registered', () => setStatus('Registered', true));
+        ua.on('registrationFailed', (e) => setStatus('Reg failed: ' + (e && e.cause ? e.cause : ''), false));
+
+        ua.on('newRTCSession', (e) => {
+          const s = e.session;
+
+          // If already in a call, reject new incoming
+          if (session && s !== session) {
+            if (s.direction === 'incoming') s.terminate();
+            return;
+          }
+
+          session = s;
+          attachSessionEvents(s);
+
+          if (s.direction === 'incoming') {
+            const from = (s.remote_identity && s.remote_identity.uri && s.remote_identity.uri.user) ? s.remote_identity.uri.user : 'Unknown';
+            showIncoming(from);
+          }
+        });
+
+        ua.start();
+        setStatus('Connecting…', false);
+      } catch (err) {
+        console.error(err);
+        setStatus('Phone init error', false);
+      }
+    }
+
+    async function ensureMic() {
+      try {
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+        return true;
+      } catch (e) {
+        alert('Mic permission is required for WebRTC calling.');
+        return false;
+      }
+    }
+
+    async function callNumber() {
+      if (!ua) return alert('Phone not ready yet.');
+      if (session) return alert('Already in a call.');
+      const ok = await ensureMic();
+      if (!ok) return;
+
+      const n = (document.getElementById('dialInput').value || '').trim();
+      if (!n) return;
+
+      const target = 'sip:' + n + '@' + SIP_DOMAIN;
+      setStatus('Calling ' + n + '…', true);
+      setInCall(true);
+
+      session = ua.call(target, { mediaConstraints: { audio: true, video: false } });
+      attachSessionEvents(session);
+    }
+
+    function hangup() {
+      if (session) session.terminate();
+    }
+
+    document.getElementById('callBtn').addEventListener('click', callNumber);
+    document.getElementById('hangupBtn').addEventListener('click', hangup);
+
+    document.getElementById('answerBtn').addEventListener('click', async () => {
+      if (!session) return;
+      const ok = await ensureMic();
+      if (!ok) return;
+      session.answer({ mediaConstraints: { audio:true, video:false } });
+    });
+
+    document.getElementById('declineBtn').addEventListener('click', () => {
+      if (session) session.terminate();
+    });
+
+    // Dial pad
+    const pad = document.getElementById('dialpad');
+    const keys = ['1','2','3','4','5','6','7','8','9','*','0','#'];
+    keys.forEach(k => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = k;
+      b.addEventListener('click', () => {
+        const inp = document.getElementById('dialInput');
+        inp.value = (inp.value || '') + k;
+        inp.focus();
+      });
+      pad.appendChild(b);
+    });
+
+    // ======== MESSAGING ========
+    let activePhone = null;
+
+    function normPhone(s) { return String(s || '').trim(); }
+
+    async function loadConversations() {
+      const res = await fetch('/api/conversations');
+      if (!res.ok) return;
+      const data = await res.json();
+
+      const convListEl = document.getElementById('convList');
+      convListEl.innerHTML = '';
+
+      data.forEach(conv => {
+        const div = document.createElement('div');
+        div.className = 'conv' + (activePhone === conv.phone ? ' active' : '');
+
+        const top = document.createElement('div');
+        top.className = 'conv-top';
+
+        const phone = document.createElement('div');
+        phone.className = 'conv-phone';
+        phone.textContent = conv.phone;
+
+        const time = document.createElement('div');
+        time.className = 'conv-time';
+        time.textContent = conv.lastTime || '';
+
+        top.appendChild(phone);
+        top.appendChild(time);
+
+        const preview = document.createElement('div');
+        preview.className = 'conv-preview';
+        preview.textContent = conv.lastMessage || '';
+
+        div.appendChild(top);
+        div.appendChild(preview);
+
+        div.onclick = () => selectConv(conv.phone);
+        convListEl.appendChild(div);
+      });
+    }
+
+    async function selectConv(phone) {
+      activePhone = phone;
+      document.getElementById('activeTitle').textContent = phone;
+      await loadMessages();
+      await loadConversations();
+    }
+
+    async function loadMessages() {
+      if (!activePhone) return;
+      const res = await fetch('/api/messages?phone=' + encodeURIComponent(activePhone));
+      if (!res.ok) return;
+      const msgs = await res.json();
+
+      const box = document.getElementById('messages');
+      box.innerHTML = '';
+
+      msgs.forEach(m => {
+        const wrap = document.createElement('div');
+        wrap.className = 'msg-wrap';
+
+        const bubble = document.createElement('div');
+        bubble.className = 'msg ' + (m.direction || 'inbound');
+        bubble.textContent = m.body || '';
+        wrap.appendChild(bubble);
+
+        if (m.media && Array.isArray(m.media) && m.media.length) {
+          const media = document.createElement('div');
+          media.className = 'media';
+          m.media.forEach(x => {
+            if (x && x.url) {
+              const img = document.createElement('img');
+              img.src = x.url;
+              img.title = 'Tap to open full';
+              img.onclick = () => window.open(x.url, '_blank');
+              media.appendChild(img);
+            }
+          });
+          wrap.appendChild(media);
+        }
+
+        const ts = document.createElement('div');
+        ts.className = 'ts';
+        ts.textContent = m.at ? new Date(m.at).toLocaleString() : '';
+        wrap.appendChild(ts);
+
+        box.appendChild(wrap);
+      });
+
+      box.scrollTop = box.scrollHeight;
+    }
+
+    document.getElementById('composer').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = document.getElementById('messageInput');
+      const text = input.value.trim();
+      input.value = '';
+      if (!text || !activePhone) return;
+
+      const resp = await fetch('/api/send', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ to: activePhone, body: text })
+      });
+
+      if (!resp.ok) {
+        const t = await resp.text();
+        alert('Send failed: ' + t);
+        return;
+      }
+
+      await loadMessages();
+      await loadConversations();
+    });
+
+    document.getElementById('sendMmsUrlBtn').addEventListener('click', async () => {
+      if (!activePhone) return alert('Select a conversation first.');
+      const u = document.getElementById('mmsUrl').value.trim();
+      if (!u) return alert('Paste a PUBLIC https:// image URL first.');
+
+      const resp = await fetch('/api/send', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ to: activePhone, body: "", mediaUrls: [u] })
+      });
+
+      if (!resp.ok) {
+        const t = await resp.text();
+        alert('MMS send failed: ' + t);
+        return;
+      }
+
+      document.getElementById('mmsUrl').value = '';
+      await loadMessages();
+      await loadConversations();
+    });
+
+    // New conversation UI
+    document.getElementById('newConvBtn').addEventListener('click', () => {
+      const panel = document.getElementById('newConvPanel');
+      panel.style.display = (panel.style.display === 'none' || !panel.style.display) ? 'block' : 'none';
+    });
+
+    document.getElementById('startConvBtn').addEventListener('click', async () => {
+      const input = document.getElementById('newNumberInput');
+      const number = normPhone(input.value);
+      if (!number) return alert("Enter a phone number.");
+
+      const resp = await fetch('/api/start', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ to: number })
+      });
+
+      if (!resp.ok) {
+        const t = await resp.text();
+        alert('Start failed: ' + t);
+        return;
+      }
+
+      input.value = '';
+      document.getElementById('newConvPanel').style.display = 'none';
+      await selectConv(number);
+    });
+
+    // Upload + Send MMS (R2)
+    async function uploadFile(file) {
+      const fd = new FormData();
+      fd.append('file', file, file.name || 'upload.jpg');
+
+      const resp = await fetch('/api/upload', { method:'POST', body: fd });
+      if (!resp.ok) throw new Error(await resp.text());
+      return await resp.json(); // {url}
+    }
+
+    async function uploadAndSend() {
+      if (!activePhone) return alert('Select a conversation first.');
+      const file = document.getElementById('filePick').files[0];
+      if (!file) return alert('Choose a file first.');
+
+      const hint = document.getElementById('mmsHint');
+      hint.textContent = 'Uploading…';
+
+      try {
+        const { url } = await uploadFile(file);
+        hint.textContent = 'Uploaded. Sending MMS…';
+
+        const resp = await fetch('/api/send', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({ to: activePhone, body: "", mediaUrls: [url] })
+        });
+
+        if (!resp.ok) throw new Error(await resp.text());
+
+        hint.textContent = 'Sent ✅';
+        document.getElementById('filePick').value = '';
+        await loadMessages();
+        await loadConversations();
+      } catch (e) {
+        hint.textContent = 'Upload/Send failed: ' + (e && e.message ? e.message : e);
+        alert(hint.textContent);
+      }
+    }
+
+    document.getElementById('uploadSendBtn').addEventListener('click', uploadAndSend);
+
+    // Drag/drop support
+    const dz = document.getElementById('dropZone');
+    dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.style.borderColor = 'rgba(34,197,94,.7)'; });
+    dz.addEventListener('dragleave', () => { dz.style.borderColor = 'rgba(255,255,255,.18)'; });
+    dz.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dz.style.borderColor = 'rgba(255,255,255,.18)';
+      const f = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) {
+        document.getElementById('filePick').files = e.dataTransfer.files;
+      }
+    });
+
+    // Start
+    loadConversations();
+    setInterval(loadConversations, 10000);
+    setInterval(() => { if (activePhone) loadMessages(); }, 5000);
+    initWebRTC();
+  </script>
+</body>
+</html>`.trim();
+
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+/* ================= STORAGE (KV) ================= */
+
+async function saveMessage(env, { phone, body, direction, media }) {
+  const kv = env.LINEAR_SMS_KV;
+  const key = `conv:${phone}`;
+  const now = Date.now();
+
+  const existing = await kv.get(key);
+  const conv = existing ? JSON.parse(existing) : { phone, messages: [], updatedAt: 0 };
+
+  conv.messages.push({
+    body: body || "",
+    direction: direction || "inbound",
+    at: now,
+    media: Array.isArray(media) ? media : [],
+  });
+  conv.updatedAt = now;
+
+  await kv.put(key, JSON.stringify(conv));
+
+  // conversation index
+  const indexKey = "conversations";
+  const raw = await kv.get(indexKey);
+  const index = raw ? JSON.parse(raw) : [];
+
+  const found = index.find((c) => c.phone === phone);
+  if (found) found.updatedAt = now;
+  else index.push({ phone, updatedAt: now });
+
+  await kv.put(indexKey, JSON.stringify(index));
+}
+
+async function listConversations(env) {
+  const kv = env.LINEAR_SMS_KV;
+  const raw = await kv.get("conversations");
+  const index = raw ? JSON.parse(raw) : [];
+
+  const result = [];
+
+  for (const c of index) {
+    const rawConv = await kv.get(`conv:${c.phone}`);
+    if (!rawConv) continue;
+
+    const conv = JSON.parse(rawConv);
+    const last = conv.messages?.[conv.messages.length - 1];
+
+    result.push({
+      phone: c.phone,
+      lastMessage: (last?.body || "").trim(),
+      lastTime: last?.at ? new Date(last.at).toLocaleTimeString() : "",
+      updatedAt: c.updatedAt || conv.updatedAt || 0,
+    });
+  }
+
+  result.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+  return json(result);
+}
+
+async function getMessages(request, env) {
+  const url = new URL(request.url);
+  const phone = url.searchParams.get("phone");
+  if (!phone) return json([]);
+
+  const kv = env.LINEAR_SMS_KV;
+  const raw = await kv.get(`conv:${phone}`);
+  const messages = raw ? (JSON.parse(raw).messages || []) : [];
+  return json(messages);
+}
+
+/* ================= API ================= */
+
+async function apiStartConversation(request, env) {
+  const { to } = await request.json();
+  if (!to) return new Response("Missing to", { status: 400 });
+
+  const kv = env.LINEAR_SMS_KV;
+  const key = `conv:${to}`;
+
+  const existing = await kv.get(key);
+  if (!existing) {
+    await kv.put(key, JSON.stringify({ phone: to, messages: [], updatedAt: Date.now() }));
+  }
+
+  const indexKey = "conversations";
+  const raw = await kv.get(indexKey);
+  const index = raw ? JSON.parse(raw) : [];
+  if (!index.find((c) => c.phone === to)) {
+    index.push({ phone: to, updatedAt: Date.now() });
+    await kv.put(indexKey, JSON.stringify(index));
+  }
+
+  return json({ ok: true });
+}
+
+async function apiSendMessage(request, env) {
+  const payload = await request.json();
+  const to = payload?.to;
+  const body = payload?.body ?? "";
+  const mediaUrls = Array.isArray(payload?.mediaUrls) ? payload.mediaUrls : [];
+
+  if (!to) return new Response("Missing to", { status: 400 });
+  if (!String(body).trim() && mediaUrls.length === 0) return new Response("Empty message", { status: 400 });
+
+  await sendMessageViaSignalWire(env, { to, body, mediaUrls });
+
+  await saveMessage(env, {
+    phone: to,
+    body,
+    direction: "outbound",
+    media: mediaUrls.map((u) => ({ url: u })),
+  });
+
+  return json({ ok: true });
+}
+
+/* ================= SignalWire SMS/MMS Send ================= */
+
+async function sendMessageViaSignalWire(env, { to, body, mediaUrls }) {
+  const url = `https://${env.SIGNALWIRE_SPACE}.signalwire.com/api/laml/2010-04-01/Accounts/${env.SIGNALWIRE_PROJECT}/Messages.json`;
+
+  const params = new URLSearchParams();
+  params.append("From", env.SIGNALWIRE_NUMBER);
+  params.append("To", to);
+  if (body !== undefined) params.append("Body", body);
+
+  for (const u of mediaUrls || []) {
+    if (u) params.append("MediaUrl", u);
+  }
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: "Basic " + btoa(`${env.SIGNALWIRE_PROJECT}:${env.SIGNALWIRE_TOKEN}`),
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: params,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.log("SignalWire send error:", res.status, text);
+    throw new Error(text || "Failed to send message");
+  }
+}
+
+/* ================= Incoming SMS/MMS Webhook ================= */
+
+async function handleSms(request, env) {
+  const headers = { "Content-Type": "application/xml" };
+
+  const formData = await request.formData();
+  const from = formData.get("From");
+  const body = (formData.get("Body") || "").trim();
+
+  const numMedia = Number(formData.get("NumMedia") || 0);
+  const media = [];
+  for (let i = 0; i < numMedia; i++) {
+    const u = formData.get(`MediaUrl${i}`);
+    const ct = formData.get(`MediaContentType${i}`) || "";
+    if (u) media.push({ url: u, contentType: ct });
+  }
+
+  await saveMessage(env, { phone: from, body, direction: "inbound", media });
+
+  return new Response("<Response></Response>", { headers });
+}
+
+/* ================= IVR ================= */
+
+async function handleIvr(request, env) {
+  const headers = { "Content-Type": "application/xml" };
+
+  let digits = null;
+  if (request.method === "POST") {
+    const formData = await request.formData();
+    digits = formData.get("Digits");
+  }
+
+  if (!digits) {
+    const baseUrl = new URL(request.url);
+    const gatherAction = new URL("/ivr", baseUrl).toString();
+
+    const xml = `
+<Response>
+  <Gather action="${gatherAction}" method="POST" numDigits="1">
+    <Say>“Hi, and thank you for calling Linear Tech — your trusted IT support team.
+    We’re glad you reached out today.
+    
+    If you already know your party’s extension, you may dial it at any time.
+    
+    For technical support, please press 1 and one of our technicians will assist you.
+    To leave a message, press 2, and we’ll be sure to return your call as soon as possible.
+    For the office or billing, please press 5.
+    To reach Chaim, or for after-hours support, please press 9.
+    
+    Thank you for calling Linear Tech. Have a wonderfull day. good buy.</Say>
+  </Gather>
+  <Say>Goodbye!</Say>
+</Response>`.trim();
+
+    return new Response(xml, { headers });
+  }
+
+  // 1 = Support (rings the browser WebRTC SIP endpoint once registered)
+  if (digits === "1") {
+    const sipUser = env.WEBPHONE_SIP_USER || env.SIP_USER || "phone";
+    const sipDomain = env.WEBPHONE_SIP_DOMAIN || "linearconnect-bd2c7f803909.sip.signalwire.com";
+
+    return new Response(`
+<Response>
+  <Dial><Sip>sip:${sipUser}@${sipDomain}</Sip></Dial>
+</Response>`.trim(), { headers });
+  }
+
+  if (digits === "5") {
+    return new Response(`<Response><Dial>+19177270405</Dial></Response>`, { headers });
+  }
+
+  if (digits === "9") {
+    return new Response(`<Response><Dial>+18456041462</Dial></Response>`, { headers });
+  }
+
+  return new Response(`<Response><Say>Invalid choice.</Say></Response>`, { headers });
+}
+
+/* ================= R2 Upload for Outbound MMS =================
+   Requires:
+   - R2 bucket binding name: LINEAR_MMS_BUCKET
+   The uploaded file becomes public at:
+   - https://YOUR_WORKER_DOMAIN/mms/<filename>
+*/
+
+async function apiUpload(request, env, origin) {
+  if (!env.LINEAR_MMS_BUCKET) {
+    return new Response("R2 not configured. Bind an R2 bucket named LINEAR_MMS_BUCKET.", { status: 400 });
+  }
+
+  const form = await request.formData();
+  const file = form.get("file");
+  if (!file || typeof file === "string") return new Response("Missing file", { status: 400 });
+
+  const ct = file.type || "application/octet-stream";
+  const ok = ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(ct);
+  if (!ok) return new Response("Unsupported file type", { status: 400 });
+
+  const ext =
+    ct === "image/png" ? "png" :
+    ct === "image/gif" ? "gif" :
+    ct === "image/webp" ? "webp" : "jpg";
+
+  const name = `${crypto.randomUUID()}.${ext}`;
+  const key = `mms/${name}`;
+
+  await env.LINEAR_MMS_BUCKET.put(key, await file.arrayBuffer(), {
+    httpMetadata: { contentType: ct },
+  });
+
+  const publicUrl = `${origin}/mms/${name}`;
+  return json({ url: publicUrl });
+}
+
+async function serveMmsObject(request, env, path) {
+  if (!env.LINEAR_MMS_BUCKET) return new Response("R2 not configured", { status: 404 });
+
+  // path is /mms/<filename>
+  const name = path.slice("/mms/".length);
+  if (!name) return new Response("Not found", { status: 404 });
+
+  const key = `mms/${name}`;
+  const obj = await env.LINEAR_MMS_BUCKET.get(key);
+  if (!obj) return new Response("Not found", { status: 404 });
+
+  const headers = new Headers();
+  obj.writeHttpMetadata(headers);
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  return new Response(obj.body, { headers });
+}
+
+/* ================= Utils ================= */
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
